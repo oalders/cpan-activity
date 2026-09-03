@@ -33,9 +33,10 @@ against the same slice of 2025. All metrics are derived from MetaCPAN's
 | first-time releasers | authors whose first-*ever* CPAN upload lands in the window |
 | new distributions | releases flagged `first => true` by MetaCPAN |
 
-Numbers move as CPAN moves underneath you — new uploads keep arriving, and
-deletions can lower a count — so a re-run may differ slightly from the figures
-in the post.
+Numbers move as CPAN moves underneath you — new uploads keep arriving between
+runs — so a re-run may differ slightly from the figures in the post. Deleted
+releases are *not* subtracted: MetaCPAN keeps them on BackPAN and none of these
+queries filter on `status`, so a deletion doesn't lower a count.
 
 ## License
 

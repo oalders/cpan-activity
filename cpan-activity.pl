@@ -6,8 +6,10 @@
 # using only core Perl modules -- HTTP::Tiny and JSON::PP both ship with Perl, so
 # there is nothing to install: a stock perl can verify every figure in the post.
 # (Fittingly, you do not need CPAN to measure CPAN.) Run it and you should get the
-# same numbers the post reports, subject to CPAN moving underneath you -- new
-# uploads keep arriving, and deletions can lower a count.
+# same numbers the post reports, subject to CPAN moving underneath you: new
+# uploads keep arriving between runs. (Deleted releases are kept on BackPAN and
+# still counted here -- no query filters on status -- so a deletion does not
+# lower these counts.)
 #
 #     perl cpan-activity.pl            # print the report
 #     perl cpan-activity.pl --charts   # also (re)write the four SVG charts
@@ -39,17 +41,29 @@ use constant {
 
 my @MONTHS = qw(Jan Feb Mar Apr May Jun Jul Aug);
 
-my $HTTP = HTTP::Tiny->new( timeout => 90 );
+my $HTTP = HTTP::Tiny->new(
+    timeout => 90,
+    agent   => 'cpan-activity/1.0 (+https://github.com/oalders/cpan-activity)',
+);
 
-# POST an Elasticsearch query body to the MetaCPAN release index.
+# POST an Elasticsearch query body to the MetaCPAN release index. Retries a
+# handful of times on a transient failure (timeout, 429, or 5xx) with a short
+# backoff; a 4xx is fatal on the first try, since a bad query won't fix itself.
 sub search {
     my ($body) = @_;
-    my $res = $HTTP->post(
-        API,
-        {   headers => { 'Content-Type' => 'application/json' },
-            content => encode_json($body),
-        }
-    );
+    my $content = encode_json($body);
+    my $res;
+    for my $attempt ( 1 .. 3 ) {
+        $res = $HTTP->post(
+            API,
+            {   headers => { 'Content-Type' => 'application/json' },
+                content => $content,
+            }
+        );
+        last if $res->{success};
+        last unless $res->{status} == 599 || $res->{status} == 429 || $res->{status} >= 500;
+        sleep $attempt if $attempt < 3;
+    }
     die "MetaCPAN request failed: $res->{status} $res->{reason}\n$res->{content}\n"
         unless $res->{success};
     return decode_json( $res->{content} );
@@ -72,7 +86,7 @@ sub total_and_authors {
     my $d = search( {
         size  => 0,
         query => $query,
-        aggs  => { authors => { cardinality => { field => 'author' } } },
+        aggs  => { authors => { cardinality => { field => 'author', precision_threshold => 40000 } } },
     } );
     my $total = $d->{hits}{total};
     $total = $total->{value} if ref $total;
@@ -104,7 +118,7 @@ sub monthly_releasers {
         query => window($year),
         aggs  => { m => {
             date_histogram => { field => 'date', calendar_interval => 'month', format => 'MM' },
-            aggs => { authors => { cardinality => { field => 'author' } } },
+            aggs => { authors => { cardinality => { field => 'author', precision_threshold => 40000 } } },
         } },
     } );
     my %by = map { $_->{key_as_string} => $_->{authors}{value} }
@@ -130,8 +144,17 @@ sub author_first_dates {
                 aggs => { first => { min => { field => 'date', format => 'yyyy-MM-dd' } } },
             } },
         } );
-        $first{ $_->{key} } = $_->{first}{value_as_string}
-            for @{ $d->{aggregations}{authors}{buckets} };
+        my $agg = $d->{aggregations}{authors};
+        # size=5000 x 8 partitions caps this at 40k authors (~13k today). If a
+        # partition ever overflows, ES drops the tail into sum_other_doc_count
+        # and first-time releasers would be silently undercounted -- fail loudly
+        # instead so the number is never quietly wrong.
+        die sprintf(
+            "author partition %d overflowed (%d authors dropped past size=5000); "
+                . "raise size or num_partitions.\n",
+            $p, $agg->{sum_other_doc_count} )
+            if $agg->{sum_other_doc_count};
+        $first{ $_->{key} } = $_->{first}{value_as_string} for @{ $agg->{buckets} };
     }
     return \%first;
 }
@@ -151,7 +174,7 @@ sub firsttime_monthly {
 sub sum { my $t = 0; $t += $_ for @_; $t }
 sub max { my $m = shift; $m = $_ > $m ? $_ : $m for @_; $m }
 sub commafy { my $n = reverse shift; $n =~ s/(\d{3})(?=\d)/$1,/g; return scalar reverse $n }
-sub pct { my ( $a, $b ) = @_; sprintf '%+.1f%%', ( $b - $a ) / $a * 100 }
+sub pct { my ( $a, $b ) = @_; return 'n/a' unless $a; sprintf '%+.1f%%', ( $b - $a ) / $a * 100 }
 
 # --------------------------------------------------------------------------- #
 # SVG chart generation (theme-aware: paints via the site's CSS custom props).
